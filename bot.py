@@ -229,20 +229,48 @@ async def run():
 
             await asyncio.sleep(20)
 
-    async def connect_loop():
+        async def connect_loop():
+        backoff = OFFLINE_RETRY_SECONDS  # Startwert
+        max_backoff = 600  # max 10 Minuten
+
         while True:
             try:
-                print(f"[CHECK] connecting to @{STREAMER_UNIQUE_ID} ...")
-                await client.start()
-                print("[CHECK] disconnected, retrying...")
-                await asyncio.sleep(OFFLINE_RETRY_SECONDS)
-            except Exception as e:
-                print(f"[ERROR] {e} -> retry in {ERROR_RETRY_SECONDS}s")
+                # Immer erst sauber trennen, bevor wir neu verbinden
                 try:
                     await client.disconnect()
                 except Exception:
                     pass
-                await asyncio.sleep(ERROR_RETRY_SECONDS)
+
+                print(f"[CHECK] connecting to @{STREAMER_UNIQUE_ID} ...")
+                await client.start()
+
+                # Wenn start() zurückkommt => disconnected
+                print("[CHECK] disconnected, retrying...")
+                backoff = OFFLINE_RETRY_SECONDS
+                await asyncio.sleep(OFFLINE_RETRY_SECONDS)
+
+            except Exception as e:
+                msg = str(e)
+
+                # Sign/504/500 Fehler: Backoff hochfahren
+                if "SIGN_NOT_200" in msg or "504" in msg or "status code 500" in msg:
+                    backoff = min(max_backoff, max(60, backoff * 2))
+                    print(f"[ERROR] {e} -> sign/backoff retry in {backoff}s")
+                # "one connection per client" -> kurz warten + disconnect erzwingen
+                elif "only make one connection per client" in msg.lower():
+                    backoff = 10
+                    print(f"[ERROR] {e} -> forcing disconnect, retry in {backoff}s")
+                else:
+                    backoff = ERROR_RETRY_SECONDS
+                    print(f"[ERROR] {e} -> retry in {backoff}s")
+
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+                await asyncio.sleep(backoff)
+
 
     await asyncio.gather(connect_loop(), schedule_loop())
 
