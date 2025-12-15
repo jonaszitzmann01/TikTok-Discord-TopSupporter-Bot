@@ -36,8 +36,7 @@ def db_connect():
     return con
 
 def init_db(con):
-    cur = con.cursor()
-    cur.execute("""
+    con.execute("""
     CREATE TABLE IF NOT EXISTS gifts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         week_id TEXT,
@@ -48,7 +47,7 @@ def init_db(con):
         created_at_utc TEXT
     )
     """)
-    cur.execute("""
+    con.execute("""
     CREATE TABLE IF NOT EXISTS weekly_top5 (
         week_id TEXT,
         rank INTEGER,
@@ -58,7 +57,7 @@ def init_db(con):
         UNIQUE(week_id, rank)
     )
     """)
-    cur.execute("""
+    con.execute("""
     CREATE TABLE IF NOT EXISTS meta (
         k TEXT PRIMARY KEY,
         v TEXT
@@ -100,8 +99,12 @@ async def discord_post(content):
                 raise RuntimeError(await r.text())
 
 def format_message(title, rows):
-    lines = [title, "", "```", f"{'Rang':<4} {'User':<24} {'Coins':>8}",
-             f"{'-'*4} {'-'*24} {'-'*8}"]
+    lines = [
+        title, "",
+        "```",
+        f"{'Rang':<4} {'User':<24} {'Coins':>8}",
+        f"{'-'*4} {'-'*24} {'-'*8}"
+    ]
     for i, (u, t) in enumerate(rows, 1):
         lines.append(f"{i:<4} {(u or 'unknown')[:24]:<24} {t:>8}")
     lines.append("```")
@@ -121,11 +124,10 @@ def top5_week(con, week_id):
     return [(r[0], int(r[1] or 0)) for r in cur.fetchall()]
 
 def finalize_week(con, week_id):
-    cur = con.cursor()
     rows = top5_week(con, week_id)
     now = datetime.now(timezone.utc).isoformat()
     for i, (u, t) in enumerate(rows, 1):
-        cur.execute("""
+        con.execute("""
             INSERT OR IGNORE INTO weekly_top5
             VALUES (?,?,?,?,?)
         """, (week_id, i, u, t, now))
@@ -141,19 +143,31 @@ async def run():
     @client.on(GiftEvent)
     async def on_gift(e: GiftEvent):
         gift = e.gift
+        user = e.user.unique_id if e.user else "unknown"
+
+        # ✅ STABILE Gift-Menge
+        amount = 1
+        if hasattr(gift, "repeat_count") and gift.repeat_count:
+            amount = gift.repeat_count
+        elif hasattr(gift, "repeat_total") and gift.repeat_total:
+            amount = gift.repeat_total
+
+        diamonds = gift.diamond_count or 0
+
         week_id, _, _ = current_week()
         con.execute("""
             INSERT INTO gifts VALUES (NULL,?,?,?,?,?,?)
         """, (
             week_id,
-            e.user.unique_id if e.user else "unknown",
+            user,
             gift.name if gift else None,
-            gift.repeat_count or 1,
-            gift.diamond_count or 0,
+            amount,
+            diamonds,
             datetime.now(timezone.utc).isoformat()
         ))
         con.commit()
-        print(f"[GIFT] {week_id} {e.user.unique_id} -> {gift.name}")
+
+        print(f"[GIFT] {week_id} {user} -> {gift.name} x{amount} ({diamonds})")
 
     async def schedule_loop():
         while True:
@@ -161,25 +175,21 @@ async def run():
             week_id, y, w = current_week()
             mon, sun = week_range(y, w)
 
-            # Täglich 00:00
             if now.hour == DAILY_POST_HOUR and now.minute == DAILY_POST_MINUTE:
                 if meta_get(con, "last_daily") != now.date().isoformat():
-                    rows = top5_week(con, week_id)
                     await discord_post(format_message(
                         f"Woche {w} - {mon:%d.%m.%Y} bis {sun:%d.%m.%Y} - läuft",
-                        rows
+                        top5_week(con, week_id)
                     ))
                     meta_set(con, "last_daily", now.date().isoformat())
                     print("[DISCORD] daily posted")
 
-            # Sonntag 23:59 FINAL
             if now.isoweekday() == 7 and now.hour == SUNDAY_FINAL_HOUR and now.minute == SUNDAY_FINAL_MINUTE:
                 if meta_get(con, "last_final") != week_id:
                     finalize_week(con, week_id)
-                    rows = top5_week(con, week_id)
                     await discord_post(format_message(
                         f"Woche {w} - {mon:%d.%m.%Y} bis {sun:%d.%m.%Y} - Ende",
-                        rows
+                        top5_week(con, week_id)
                     ))
                     meta_set(con, "last_final", week_id)
                     print("[DISCORD] final posted")
@@ -199,7 +209,6 @@ async def run():
 
                 print(f"[CHECK] connecting to @{STREAMER_UNIQUE_ID}")
                 await client.start()
-                print("[CHECK] disconnected")
                 backoff = OFFLINE_RETRY_SECONDS
                 await asyncio.sleep(backoff)
 
