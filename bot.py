@@ -149,7 +149,10 @@ def finalize_week(con, week_id):
 
 # ================== HELPERS ==================
 def stable_amount_from_gift(gift) -> int:
-    # Robust gegen verschiedene TikTokLive-Versionen / Gift-Objekte
+    """
+    Robust gegen verschiedene TikTokLive-Versionen / Gift-Objekte.
+    Bei Final-Streak-Events ist repeat_count/repeat_total oft die Gesamtzahl.
+    """
     for attr in ("repeat_count", "repeat_total"):
         if hasattr(gift, attr):
             v = getattr(gift, attr)
@@ -157,9 +160,31 @@ def stable_amount_from_gift(gift) -> int:
                 return v
     return 1
 
+def should_store_gift(gift) -> bool:
+    """
+    Wichtig gegen Streak-Doubles:
+    - Wenn repeat_end existiert und False ist => nur Zwischenupdate => NICHT speichern.
+    - Wenn repeat_end True (oder Attribut fehlt) => speichern.
+    """
+    if gift is None:
+        return False
+    if hasattr(gift, "repeat_end"):
+        try:
+            # repeat_end: False während der Streak läuft, True beim finalen Event
+            if gift.repeat_end is False:
+                return False
+        except Exception:
+            # wenn irgendwas komisches ist, lieber speichern als verlieren
+            return True
+    return True
+
 def make_event_key(week_id: str, user: str, gift_name: str, diamonds: int, amount: int, ts_utc: datetime) -> str:
-    # 2-Sekunden-Bucket: verhindert Double-Events bei Reconnect / repeat-spam
-    bucket = int(ts_utc.timestamp()) // 2
+    """
+    Dedup-Key:
+    - enthält week_id + user + gift + diamonds + amount
+    - plus 5-Sekunden Bucket (nicht zu eng, damit Final-Event sicher rein fällt)
+    """
+    bucket = int(ts_utc.timestamp()) // 5
     raw = f"{week_id}|{user}|{gift_name}|{diamonds}|{amount}|{bucket}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -171,7 +196,6 @@ async def run():
 
     client = TikTokLiveClient(unique_id=STREAMER_UNIQUE_ID)
 
-    # Für Health Checks
     state = {
         "connected": False,
         "last_event_utc": datetime.now(timezone.utc),
@@ -180,10 +204,15 @@ async def run():
 
     @client.on(GiftEvent)
     async def on_gift(e: GiftEvent):
-        gift = e.gift
+        gift = getattr(e, "gift", None)
+        if not should_store_gift(gift):
+            # Zwischen-Event eines Streaks -> ignorieren (damit nix doppelt wirkt)
+            return
+
         user = getattr(e.user, "unique_id", None) or getattr(e.user, "nickname", None) or "unknown"
         gift_name = getattr(gift, "name", None) or "unknown"
         diamonds = int(getattr(gift, "diamond_count", 0) or 0)
+
         amount = stable_amount_from_gift(gift)
 
         week_id, _, _ = current_week()
@@ -212,7 +241,6 @@ async def run():
             state["last_event_utc"] = ts
             print(f"[GIFT] {week_id} {user} -> {gift_name} x{amount} (diamonds={diamonds})")
         else:
-            # Duplikat ignoriert (nicht spammen)
             state["last_event_utc"] = ts
 
     async def schedule_loop():
@@ -251,7 +279,6 @@ async def run():
 
             if state["connected"]:
                 print(f"[HEALTH] connected ✅ | last_event={int(age)}s ago")
-                # Optional: wenn lange gar kein Event kommt, kann Verbindung trotzdem hängen -> reconnect triggern
                 if age > STALE_CONNECTION_SECONDS:
                     print("[RECONNECT] no events for a while -> forcing reconnect")
                     try:
@@ -272,14 +299,14 @@ async def run():
                 state["last_connect_attempt_utc"] = datetime.now(timezone.utc)
                 print(f"[CONNECT] trying @{STREAMER_UNIQUE_ID} ...")
 
-                # immer sauber trennen vor neuem start
                 try:
                     await client.disconnect()
                 except Exception:
                     pass
 
-                await client.start()  # blockt, bis disconnected
-                # wenn wir hier sind: disconnected
+                # start() blockt bis disconnected/exception
+                await client.start()
+
                 state["connected"] = False
                 print("[LIVE] disconnected ❌ -> will retry")
                 backoff = OFFLINE_RETRY_SECONDS
@@ -290,17 +317,14 @@ async def run():
                 msg = str(e)
                 low = msg.lower()
 
-                # sehr häufig: offline (kein echter Fehler)
                 if "offline" in low:
                     backoff = OFFLINE_RETRY_SECONDS
                     print(f"[LIVE] streamer offline -> retry in {backoff}s")
 
-                # Sign/504/500: Backoff hochfahren
                 elif "sign" in low or "504" in low or "status code 500" in low:
                     backoff = min(max_backoff, max(60, backoff * 2))
                     print(f"[ERROR] sign/timeout -> retry in {backoff}s | {msg}")
 
-                # doppelte Verbindung
                 elif "one connection" in low:
                     backoff = 10
                     print(f"[ERROR] double-connection -> retry in {backoff}s | {msg}")
@@ -315,22 +339,9 @@ async def run():
                     pass
 
                 await asyncio.sleep(backoff)
-            else:
-                # nur falls start() ohne Exception sofort zurückkommt (selten)
-                state["connected"] = True
-                print("[LIVE] connected ✅")
 
-    # Wenn die Library einen Connect-Event hätte, könnte man state["connected"]=True setzen.
-    # Praktisch: sobald Gifts kommen, wissen wir: verbunden. Zusätzlich setzen wir "connected" hier,
-    # wenn start() erfolgreich läuft (nicht mit Exception rausfliegt).
     async def connection_flag_loop():
-        # Heuristik: wenn connect_loop gerade läuft und keine Exception/Disconnect meldet,
-        # setzen wir connected auf True, sobald wir mind. einmal erfolgreich starten konnten.
-        # Da client.start() blockt, ist das schwer perfekt zu erkennen, aber:
-        # - wenn Gifts reinkommen => connected.
-        # - health_loop zeigt "connected" anhand von state["connected"].
         while True:
-            # Wenn in den letzten 10 Sekunden ein Event kam -> connected
             age = (datetime.now(timezone.utc) - state["last_event_utc"]).total_seconds()
             if age < 10:
                 state["connected"] = True
