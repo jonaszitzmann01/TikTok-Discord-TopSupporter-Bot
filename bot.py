@@ -208,7 +208,7 @@ async def run():
             if now.hour == DAILY_POST_HOUR and now.minute == DAILY_POST_MINUTE:
                 today = now.date().isoformat()
                 if today != last_daily_post_date:
-                    title = f"Woche {week} - {mon.strftime('%d.%m.%Y')} bis {sun.strftime('%d.%m.%Y')} - läuft"
+                    title = f"**Woche {week} - {mon.strftime('%d.%m.%Y')} bis {sun.strftime('%d.%m.%Y')} - LÄUFT**"
                     rows = top5_for_week(con, week_id)
                     await discord_post(format_top5_message(title, rows))
                     last_daily_post_date = today
@@ -220,7 +220,7 @@ async def run():
             if now.isoweekday() == 7 and now.hour == SUNDAY_FINAL_HOUR and now.minute == SUNDAY_FINAL_MINUTE:
                 if week_id != last_final_post_week:
                     finalize_week(con, week_id)
-                    title = f"Woche {week} - {mon.strftime('%d.%m.%Y')} bis {sun.strftime('%d.%m.%Y')} - Ende"
+                    title = f"**Woche {week} - {mon.strftime('%d.%m.%Y')} bis {sun.strftime('%d.%m.%Y')} - ENDE**"
                     rows = top5_final(con, week_id)
                     await discord_post(format_top5_message(title, rows))
                     last_final_post_week = week_id
